@@ -1,4 +1,5 @@
 ﻿using BOLL7708;
+using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -6,6 +7,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -13,6 +15,7 @@ using Valve.VR;
 using static BOLL7708.EasyOpenVRSingleton;
 using BOLL7708.EasyCSUtils;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using SuperScreenShotterVR.Remote;
 
 namespace SuperScreenShotterVR
@@ -25,6 +28,7 @@ namespace SuperScreenShotterVR
         private bool _initComplete = false;
         private bool _isHookedForScreenshots = false;
         private string _currentAppId = "";
+        private string _currentAppName = "";
         private ulong _notificationOverlayHandle = 0;
         private Dictionary<uint, ScreenshotData> _screenshotQueue = new Dictionary<uint, ScreenshotData>();
         private uint _lastScreenshotHandle = 0;
@@ -32,6 +36,7 @@ namespace SuperScreenShotterVR
         private MediaPlayer _mediaPlayer;
         private string _currentAudio = string.Empty;
         private Stopwatch _stopWatch = new Stopwatch();
+        private string _steamConfigDirectory = null;
 
         private const string VIEWFINDER_OVERLAY_UNIQUE_KEY = "boll7708.superscreenshottervr.overlay.viewfinder";
         private const string ROLL_INDICATOR_OVERLAY_UNIQUE_KEY = "boll7708.superscreenshottervr.overlay.rollindicator";
@@ -52,13 +57,15 @@ namespace SuperScreenShotterVR
 
         // Actions
         public Action<bool> StatusUpdateAction { get; set; } = (status) => { Debug.WriteLine("No status action set."); };
-        public Action<string> AppUpdateAction { get; set; } = (appId) => { Debug.WriteLine("No appID action set."); };
+        public Action<string, string> AppUpdateAction { get; set; } = (appId, appName) => { Debug.WriteLine("No appID action set."); };
         public Action ExitAction { get; set; } = () => { Debug.WriteLine("No exit action set."); };
+
+        private string _currentAppNameOrId => _currentAppName != string.Empty ? _currentAppName : _currentAppId;
 
         public void Init()
         {
             StatusUpdateAction.Invoke(false);
-            AppUpdateAction.Invoke("");
+            AppUpdateAction.Invoke(string.Empty, string.Empty);
 
             _mediaPlayer = new MediaPlayer();
 
@@ -124,8 +131,17 @@ namespace SuperScreenShotterVR
                         // Screenshots
                         UpdateScreenshotHook();
                         PlayScreenshotSound(true);
+                        
+                        var steamConfigDirectory = Path.Combine(GetSteamDirectory(), "config");
+
+                        if (Directory.Exists(steamConfigDirectory))
+                        {
+                            _steamConfigDirectory = steamConfigDirectory;
+                        }
+
                         _currentAppId = _ovr.GetRunningApplicationId();
-                        AppUpdateAction.Invoke(_currentAppId);
+                        _currentAppName = GetAppNameFromId(_currentAppId);
+                        AppUpdateAction.Invoke(_currentAppId, _currentAppName);
                         // ToggleViewfinder(true); // DEBUG
                         UpdateTrackedDeviceIndex();
                         UpdateDisplayFrequency();
@@ -161,6 +177,7 @@ namespace SuperScreenShotterVR
                         
                         _notificationOverlayHandle = _ovr.InitNotificationOverlay("SuperScreenShotterVR");
                         _currentAppId = _ovr.GetRunningApplicationId();
+                        _currentAppName = GetAppNameFromId(_currentAppId);
 
                         // Events
                         _ovr.RegisterEvent(EVREventType.VREvent_RequestScreenshot, (data) => { 
@@ -189,12 +206,13 @@ namespace SuperScreenShotterVR
                         });
                         _ovr.RegisterEvent(EVREventType.VREvent_SceneApplicationChanged, (data) => {
                             _currentAppId = _ovr.GetRunningApplicationId();
-                            AppUpdateAction.Invoke(_currentAppId);
+                            _currentAppName = GetAppNameFromId(_currentAppId);
+                            AppUpdateAction.Invoke(_currentAppId, _currentAppName);
                             _isHookedForScreenshots = false; // To enable rehooking
                             UpdateScreenshotHook(); // Hook at new application as it seems to occasionally get dropped
                             UpdateOutputFolder();
                             _screenshotQueue.Clear(); // To not have left-overs
-                            Debug.WriteLine($"New application running: {_currentAppId}");
+                            Debug.WriteLine($"New application running: {_currentAppName} ({_currentAppId})");
                         });
                         _ovr.RegisterEvent(EVREventType.VREvent_Quit, (data) =>
                         {
@@ -408,10 +426,10 @@ namespace SuperScreenShotterVR
             {
                 var dir = _settings.Directory;
                 if (createDirIfNeeded && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
-                if(_currentAppId != string.Empty)
+                if(_currentAppNameOrId != string.Empty)
                 {
-                    Debug.WriteLine($"Settings subfolder to: {_currentAppId}");
-                    dir = $"{dir}\\{_currentAppId}";
+                    Debug.WriteLine($"Settings subfolder to: {_currentAppNameOrId}");
+                    dir = $"{dir}\\{_currentAppNameOrId}";
                     if (subfolder != string.Empty) dir = $"{dir}\\{subfolder}";
                     if (createDirIfNeeded && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
                 } else
@@ -613,6 +631,51 @@ namespace SuperScreenShotterVR
             Debug.WriteLine($"Screenshot taken done, handle: {eventData.screenshot.handle}");
         }
 
+        private string GetAppNameFromId(string id)
+        {
+            if (_steamConfigDirectory == null || id == string.Empty)
+            {
+                return string.Empty;
+            }
+
+            try
+            {
+                JObject appConfig;
+
+                using (var streamReader = new StreamReader(Path.Combine(_steamConfigDirectory, "appconfig.json")))
+                {
+                    appConfig = JsonConvert.DeserializeObject<JObject>(streamReader.ReadToEnd());
+                }
+
+                foreach (var manifestPath in appConfig.Value<JArray>("manifest_paths").Values<string>())
+                {
+                    JObject vrmanifest;
+
+                    using (var streamReader = new StreamReader(manifestPath))
+                    {
+                        vrmanifest = JsonConvert.DeserializeObject<JObject>(streamReader.ReadToEnd());
+                    }
+
+                    foreach (var application in vrmanifest.Value<JArray>("applications").Values<JObject>())
+                    {
+                        if (application.Value<string>("app_key").Equals(id, StringComparison.InvariantCultureIgnoreCase))
+                        {
+                            return application.Value<JObject>("strings")?.Value<JObject>("en_us")?.Value<string>("name");
+                        }
+                    }
+                }
+
+                return "Unknown App";
+            }
+            catch (IOException ex)
+            {
+                Debug.WriteLine($"Could not get app name from ID\n{ex}");
+
+                return "Unknown App";
+            }
+        }
+
+
         // https://stackoverflow.com/q/2419222
         public static void SaveBitmapToPngFile(Bitmap bitmap, String filePath)
         {
@@ -716,6 +779,34 @@ namespace SuperScreenShotterVR
                 var b64 = Convert.ToBase64String(ms.GetBuffer());
                 return b64;
             }
+        }
+
+        private static string GetSteamDirectory()
+        {
+            string steamPath = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "SteamPath", string.Empty).ToString();
+
+            if (!string.IsNullOrEmpty(steamPath) && Directory.Exists(steamPath))
+            {
+                return steamPath.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+            }
+
+            Process steamProcess = Process.GetProcessesByName("Steam").FirstOrDefault();
+
+            if (steamProcess == null)
+            {
+                Debug.WriteLine("Steam process could not be found.");
+                return null;
+            }
+
+            string exePath = steamProcess.MainModule.FileName;
+
+            if (string.IsNullOrEmpty(steamProcess.MainModule.FileName) || !Directory.Exists(steamPath))
+            {
+                Debug.WriteLine("Steam process could not be found.");
+                return null;
+            }
+
+            return Path.GetDirectoryName(exePath).Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
         }
     }
 }

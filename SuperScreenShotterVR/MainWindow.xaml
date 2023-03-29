@@ -19,7 +19,7 @@
                         <Label x:Name="Label_Status" Content="OpenVR Status" Background="Gray" Foreground="White"/>
                     </StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="5 0 5 5">
-                        <Label Content="Current app ID:"/>
+                        <Label Content="Current app:"/>
                         <Label x:Name="Label_AppId" Content="Steam AppID" Background="Gray" Foreground="White"/>
                     </StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="5 0 5 5">
